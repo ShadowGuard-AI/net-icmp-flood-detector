@@ -33,6 +33,9 @@ def analyze_icmp_packets(interface, threshold, duration):
     """
     Monitors ICMP packets on the specified interface and alerts if the threshold is exceeded.
     """
+    # AF_PACKET is Linux only and opening this socket needs root or
+    # CAP_NET_RAW. On an unprivileged run the socket call itself raises
+    # and the error handlers below are the only output the user gets.
     try:
         # Create a raw socket to capture all packets
         sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))  # 3 is for all protocols
@@ -43,10 +46,17 @@ def analyze_icmp_packets(interface, threshold, duration):
 
         logging.info(f"Monitoring ICMP packets on interface {interface} for {duration} seconds with a threshold of {threshold} packets/second.")
 
+        # recv blocks with no timeout, so the duration check only runs
+        # when a packet actually arrives. On a quiet interface this loop
+        # sits inside recv past the requested duration until traffic
+        # shows up, and only then notices the time is up.
         while time.time() - start_time < duration:
             packet = sock.recv(65535)  # Receive a packet
             
             # Ethernet header is 14 bytes. IP header starts after that.
+            # I assume plain Ethernet here: a VLAN tag adds four bytes
+            # and would shift every offset below, so tagged frames are
+            # misread rather than detected as ICMP.
             ip_header = packet[14:34]
             ip_header_len = (ip_header[0] & 0x0F) * 4 # Extract IHL (IP Header Length) and multiply by 4
             
@@ -55,6 +65,11 @@ def analyze_icmp_packets(interface, threshold, duration):
             if protocol == 1:  # ICMP protocol is 1
                 packet_count += 1
 
+            # The rate is an average over the whole current window, not
+            # a count in the last second, and the window only resets
+            # after this check fires. A burst that straddles a reset gets
+            # split across two windows and can stay under the threshold
+            # in both even though the combined rate was over it.
             elapsed_time = time.time() - start_time
             if elapsed_time >= 1:  # Check every second
                 packets_per_second = packet_count / elapsed_time
@@ -81,6 +96,10 @@ def main():
     """
     args = setup_argparse()
 
+    # The file handler is added after basicConfig already set up console
+    # output, so warnings from here on land in both places. Validation
+    # failures below return instead of exiting non-zero, which a calling
+    # script would read as success.
     # Configure logging to file
     file_handler = logging.FileHandler(args.log_file)
     file_handler.setLevel(logging.INFO)
